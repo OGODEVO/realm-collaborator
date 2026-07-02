@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from agentnet.sdk import AgentSDK
+from agentnet.exceptions import DeliveryAckTimeout, TransportError
 from agentnet.task_protocol import TERMINAL_TASK_TYPES, new_task_id
 from mcp.server.fastmcp import FastMCP
 
@@ -26,11 +27,14 @@ BLOB_DIR = os.getenv(
     "REALM_COLLABORATOR_BLOB_DIR",
     str(Path.home() / ".local" / "share" / "realm-collaborator" / "blobs"),
 )
+WORKFLOW_DIR = Path(BLOB_DIR) / "workflows"
 MAX_COUNCIL_AGENTS = int(os.getenv("REALM_COLLAB_MAX_COUNCIL_AGENTS", "12"))
 MAX_CHAIN_AGENTS = int(os.getenv("REALM_COLLAB_MAX_CHAIN_AGENTS", "20"))
 TASK_POLL_SECONDS = float(os.getenv("REALM_COLLAB_TASK_POLL_SECONDS", "2"))
 
 _sdk: AgentSDK | None = None
+_workflows: dict[str, dict[str, Any]] = {}
+_workflow_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 def _json(data: Any) -> str:
@@ -41,6 +45,54 @@ def _sdk_or_raise() -> AgentSDK:
     if _sdk is None:
         raise RuntimeError("Realm collaborator SDK is not connected")
     return _sdk
+
+
+def _workflow_path(workflow_id: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(workflow_id))
+    return WORKFLOW_DIR / f"{safe}.json"
+
+
+def _save_workflow(workflow: dict[str, Any]) -> None:
+    workflow_id = str(workflow.get("workflow_id") or "")
+    if not workflow_id:
+        return
+    WORKFLOW_DIR.mkdir(parents=True, exist_ok=True)
+    _workflows[workflow_id] = workflow
+    _workflow_path(workflow_id).write_text(_json(workflow) + "\n", encoding="utf-8")
+
+
+def _load_workflow(workflow_id: str) -> dict[str, Any] | None:
+    if workflow_id in _workflows:
+        return _workflows[workflow_id]
+    path = _workflow_path(workflow_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        _workflows[workflow_id] = data
+        return data
+    return None
+
+
+def _start_workflow(workflow: dict[str, Any], runner: Any) -> str:
+    workflow_id = str(workflow["workflow_id"])
+    _save_workflow(workflow)
+
+    async def wrapped() -> None:
+        try:
+            await runner()
+        except Exception as exc:
+            current = _load_workflow(workflow_id) or workflow
+            current["ok"] = False
+            current["status"] = "failed"
+            current["error"] = str(exc)
+            _save_workflow(current)
+
+    _workflow_tasks[workflow_id] = asyncio.create_task(wrapped(), name=f"realm-collab-{workflow_id}")
+    return workflow_id
 
 
 def _clean_agents(agents: list[str]) -> list[str]:
@@ -108,16 +160,7 @@ async def _delegate(
             "thread_id": thread_id,
             "delivery_ack": "ok",
         }
-    except RuntimeError as exc:
-        if "delivery_ack_timeout" not in str(exc):
-            return {
-                "ok": False,
-                "agent": to,
-                "task_id": task_id,
-                "thread_id": thread_id,
-                "delivery_ack": "failed",
-                "error": str(exc),
-            }
+    except DeliveryAckTimeout:
         return {
             "ok": True,
             "agent": to,
@@ -125,6 +168,16 @@ async def _delegate(
             "thread_id": thread_id,
             "delivery_ack": "timeout",
             "warning": "delivery ack timed out; task may still be running in registry",
+        }
+    except TransportError as exc:
+        return {
+            "ok": False,
+            "agent": to,
+            "task_id": task_id,
+            "thread_id": thread_id,
+            "delivery_ack": "failed",
+            "error": str(exc),
+            "error_instance_id": getattr(exc, "error_instance_id", None),
         }
 
 
@@ -235,7 +288,11 @@ async def collaborate_chain(
     stop_on_failure: bool = True,
     final_output_contract: str = "End with a clear handoff summary and concrete next action.",
 ) -> str:
-    """Run a sequential agent handoff: agent1 -> agent2 -> agent3 -> result."""
+    """Start a sequential agent handoff workflow and return immediately.
+
+    Use collaborate_status(workflow_id) to poll completion. The workflow runs
+    in the background so long chains do not exceed MCP client timeouts.
+    """
     sdk = _sdk_or_raise()
     chain = _clean_agents(agents)
     if not chain:
@@ -243,48 +300,84 @@ async def collaborate_chain(
     if len(chain) > MAX_CHAIN_AGENTS:
         raise ValueError(f"chain has {len(chain)} agents; max is {MAX_CHAIN_AGENTS}")
     tid = thread_id.strip() or sdk.new_thread_id()
+    workflow_id = new_task_id("chain")
+    workflow: dict[str, Any] = {
+        "ok": None,
+        "workflow_id": workflow_id,
+        "mode": "chain",
+        "status": "running",
+        "thread_id": tid,
+        "agents": chain,
+        "steps": [],
+        "final": "",
+    }
 
-    steps: list[dict[str, Any]] = []
-    prior_results: list[dict[str, Any]] = []
-    for index, agent in enumerate(chain):
-        prompt = _chain_prompt(
-            original_task=task,
-            step_index=index,
-            total_steps=len(chain),
-            agent=agent,
-            prior_results=prior_results,
-            final_output_contract=final_output_contract,
-        )
-        delegated = await _delegate(
-            sdk,
-            to=agent,
-            text=prompt,
-            title=f"{title} step {index + 1}/{len(chain)}",
-            thread_id=tid,
-            metadata={"workflow": "chain", "step": index + 1, "total_steps": len(chain)},
-        )
-        task_result = await _await_task_result(sdk, delegated["task_id"], timeout_per_agent)
-        step = {
-            **delegated,
-            "status": str(task_result.get("status") or "unknown"),
-            "type": str(task_result.get("type") or ""),
-            "text": _result_text(task_result),
-            "raw_result": task_result,
-        }
-        steps.append(step)
-        prior_results.append({"agent": agent, "status": step["status"], "text": step["text"]})
-        if stop_on_failure and step["status"] in {"failed", "blocked", "timeout"}:
-            break
+    async def run() -> None:
+        steps: list[dict[str, Any]] = []
+        prior_results: list[dict[str, Any]] = []
+        for index, agent in enumerate(chain):
+            current = _load_workflow(workflow_id) or workflow
+            current["status"] = "running"
+            current["current_step"] = index + 1
+            current["current_agent"] = agent
+            _save_workflow(current)
 
-    final = steps[-1]["text"] if steps else ""
+            prompt = _chain_prompt(
+                original_task=task,
+                step_index=index,
+                total_steps=len(chain),
+                agent=agent,
+                prior_results=prior_results,
+                final_output_contract=final_output_contract,
+            )
+            delegated = await _delegate(
+                sdk,
+                to=agent,
+                text=prompt,
+                title=f"{title} step {index + 1}/{len(chain)}",
+                thread_id=tid,
+                metadata={"workflow": "chain", "workflow_id": workflow_id, "step": index + 1, "total_steps": len(chain)},
+            )
+            task_result = await _await_task_result(sdk, delegated["task_id"], timeout_per_agent)
+            step = {
+                **delegated,
+                "status": str(task_result.get("status") or "unknown"),
+                "type": str(task_result.get("type") or ""),
+                "text": _result_text(task_result),
+                "raw_result": task_result,
+            }
+            steps.append(step)
+            prior_results.append({"agent": agent, "status": step["status"], "text": step["text"]})
+            current = _load_workflow(workflow_id) or workflow
+            current["steps"] = steps
+            current["final"] = steps[-1]["text"] if steps else ""
+            _save_workflow(current)
+            if stop_on_failure and step["status"] in {"failed", "blocked", "timeout"}:
+                break
+
+        final = steps[-1]["text"] if steps else ""
+        completed = bool(steps) and len(steps) == len(chain) and steps[-1]["status"] == "completed"
+        current = _load_workflow(workflow_id) or workflow
+        current.update(
+            {
+                "ok": completed,
+                "status": "completed" if completed else "failed",
+                "steps": steps,
+                "final": final,
+            }
+        )
+        _save_workflow(current)
+
+    _start_workflow(workflow, run)
     return _json(
         {
-            "ok": bool(steps) and steps[-1]["status"] == "completed",
+            "ok": True,
+            "workflow_id": workflow_id,
             "mode": "chain",
+            "status": "running",
             "thread_id": tid,
             "agents": chain,
-            "steps": steps,
-            "final": final,
+            "next": f"Use collaborate_status with workflow_id={workflow_id}",
         }
     )
 
@@ -300,7 +393,11 @@ async def collaborate_council(
     synthesis_instructions: str = "Return consensus, disagreements, risks, and final recommendation.",
     mode_note: str = "Give an independent answer; do not copy or wait for teammates.",
 ) -> str:
-    """Run agents in parallel, then optionally ask a judge agent to synthesize."""
+    """Start a parallel council workflow and return immediately.
+
+    Use collaborate_status(workflow_id) to poll completion. The workflow runs
+    in the background so councils do not exceed MCP client timeouts.
+    """
     sdk = _sdk_or_raise()
     council = _clean_agents(agents)
     if not council:
@@ -308,62 +405,109 @@ async def collaborate_council(
     if len(council) > MAX_COUNCIL_AGENTS:
         raise ValueError(f"council has {len(council)} agents; max is {MAX_COUNCIL_AGENTS}")
     tid = thread_id.strip() or sdk.new_thread_id()
+    workflow_id = new_task_id("council")
+    workflow: dict[str, Any] = {
+        "ok": None,
+        "workflow_id": workflow_id,
+        "mode": "council",
+        "status": "running",
+        "thread_id": tid,
+        "agents": council,
+        "results": [],
+        "judge": None,
+        "final": "",
+    }
 
-    async def run_member(agent: str) -> dict[str, Any]:
-        delegated = await _delegate(
-            sdk,
-            to=agent,
-            text=_council_prompt(task, mode_note),
-            title=title,
-            thread_id=tid,
-            metadata={"workflow": "council", "role": "member", "members": council},
+    async def run() -> None:
+        async def run_member(agent: str) -> dict[str, Any]:
+            delegated = await _delegate(
+                sdk,
+                to=agent,
+                text=_council_prompt(task, mode_note),
+                title=title,
+                thread_id=tid,
+                metadata={"workflow": "council", "workflow_id": workflow_id, "role": "member", "members": council},
+            )
+            task_result = await _await_task_result(sdk, delegated["task_id"], timeout)
+            result = {
+                **delegated,
+                "status": str(task_result.get("status") or "unknown"),
+                "type": str(task_result.get("type") or ""),
+                "text": _result_text(task_result),
+                "raw_result": task_result,
+            }
+            current = _load_workflow(workflow_id) or workflow
+            current["results"] = [*current.get("results", []), result]
+            _save_workflow(current)
+            return result
+
+        results = await asyncio.gather(*(run_member(agent) for agent in council))
+
+        judge_result: dict[str, Any] | None = None
+        if judge_agent.strip():
+            judge = _clean_agents([judge_agent])[0]
+            current = _load_workflow(workflow_id) or workflow
+            current["judge_agent"] = judge
+            _save_workflow(current)
+            delegated = await _delegate(
+                sdk,
+                to=judge,
+                text=_judge_prompt(task, results, synthesis_instructions),
+                title=f"{title} synthesis",
+                thread_id=tid,
+                metadata={"workflow": "council", "workflow_id": workflow_id, "role": "judge", "members": council},
+            )
+            raw = await _await_task_result(sdk, delegated["task_id"], timeout)
+            judge_result = {
+                **delegated,
+                "status": str(raw.get("status") or "unknown"),
+                "type": str(raw.get("type") or ""),
+                "text": _result_text(raw),
+                "raw_result": raw,
+            }
+
+        completed = [item for item in results if item["status"] == "completed"]
+        final = judge_result["text"] if judge_result else "\n\n".join(
+            f"{item['agent']}:\n{item['text']}" for item in results
         )
-        task_result = await _await_task_result(sdk, delegated["task_id"], timeout)
-        return {
-            **delegated,
-            "status": str(task_result.get("status") or "unknown"),
-            "type": str(task_result.get("type") or ""),
-            "text": _result_text(task_result),
-            "raw_result": task_result,
-        }
-
-    results = await asyncio.gather(*(run_member(agent) for agent in council))
-
-    judge_result: dict[str, Any] | None = None
-    if judge_agent.strip():
-        judge = _clean_agents([judge_agent])[0]
-        delegated = await _delegate(
-            sdk,
-            to=judge,
-            text=_judge_prompt(task, results, synthesis_instructions),
-            title=f"{title} synthesis",
-            thread_id=tid,
-            metadata={"workflow": "council", "role": "judge", "members": council},
+        ok = len(completed) == len(results) and (judge_result is None or judge_result["status"] == "completed")
+        current = _load_workflow(workflow_id) or workflow
+        current.update(
+            {
+                "ok": ok,
+                "status": "completed" if ok else "failed",
+                "results": results,
+                "judge": judge_result,
+                "final": final,
+            }
         )
-        raw = await _await_task_result(sdk, delegated["task_id"], timeout)
-        judge_result = {
-            **delegated,
-            "status": str(raw.get("status") or "unknown"),
-            "type": str(raw.get("type") or ""),
-            "text": _result_text(raw),
-            "raw_result": raw,
-        }
+        _save_workflow(current)
 
-    completed = [item for item in results if item["status"] == "completed"]
-    final = judge_result["text"] if judge_result else "\n\n".join(
-        f"{item['agent']}:\n{item['text']}" for item in results
-    )
+    _start_workflow(workflow, run)
     return _json(
         {
-            "ok": len(completed) == len(results) and (judge_result is None or judge_result["status"] == "completed"),
+            "ok": True,
+            "workflow_id": workflow_id,
             "mode": "council",
+            "status": "running",
             "thread_id": tid,
             "agents": council,
-            "results": results,
-            "judge": judge_result,
-            "final": final,
+            "judge_agent": judge_agent,
+            "next": f"Use collaborate_status with workflow_id={workflow_id}",
         }
     )
+
+
+@mcp.tool()
+def collaborate_status(workflow_id: str) -> str:
+    """Read the current/final state of a background collaboration workflow."""
+    workflow = _load_workflow(workflow_id)
+    if workflow is None:
+        return _json({"ok": False, "error": "unknown_workflow", "workflow_id": workflow_id})
+    task = _workflow_tasks.get(str(workflow_id))
+    if task is not None and not task.done():
+        workflow["status"] = workflow.get("status") or "running"
+    return _json(workflow)
 
 
 @mcp.tool()
